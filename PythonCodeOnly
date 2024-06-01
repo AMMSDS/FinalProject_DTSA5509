@@ -1,0 +1,449 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import xgboost as xgb
+
+from itertools import combinations
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, accuracy_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+
+from statsmodels.graphics.gofplots import qqplot
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+#data read in
+data = pd.read_csv('ObesityDataSet_raw_and_data_sinthetic.csv')
+
+data.info()
+data.head()
+
+data.describe()
+
+#renames the columns of the data
+renameCol = ['gender', 'age', 'height', 'weight', 'family_hist', 'high_cal', 'vegetable_cons', 'meal_num', 'between_meals', 'smoke', 'water_cons', 'monitor_cal', 'physical_act', 'tech_time', 'alcohol_cons', 'transport_type', 'weight_category']
+
+data.columns = renameCol
+data.head()
+
+#calculates bmi and adds a bmi column
+data['bmi'] = data['weight']/(data['height'] ** 2)
+data.head()
+
+#checks the min and max of each weight category
+bmi_stats = data.groupby('weight_category')['bmi'].agg(['min', 'max']).reset_index()
+print(bmi_stats)
+
+#function to assign the proper category using bmi
+def bmi_to_class(bmi):
+    if bmi < 18.5:
+        return 'Underweight'
+    elif 18.5 <= bmi < 25.0:
+        return 'Normal'
+    elif 25.0 <= bmi < 30.0:
+        return 'Overweight'
+    elif 30.0 <= bmi < 35.0:
+        return 'Obesity_I'
+    elif 35.0 <= bmi < 40.0:
+        return 'Obesity_II'
+    else:
+        return 'Obesity_III'
+
+#applies function and creates a new column of the proper categories
+data['obesity_class'] = data['bmi'].apply(bmi_to_class)
+data.head()
+
+#drops height, weight, and inaccurate weight category columns
+data = data.drop(columns = ['height', 'weight', 'weight_category'])
+data.head()
+
+#function to get unique values from each column
+def get_unique_col_values(data):
+  uniqueColVal = {column: data[column].unique() for column in data.columns}
+  for column, values in uniqueColVal.items():
+    print(f'{column}: {values}')
+  return
+
+get_unique_col_values(data)
+
+#finds the floor of every numeric column but bmi
+numCols = data.select_dtypes(include = [np.number]).columns.drop('bmi')
+
+data[numCols] = data[numCols].apply(np.floor)
+
+get_unique_col_values(data)
+
+#initial category mapping common survey responses for all columns
+categoryMap = {'yes': 1, 'no': 0, 'Sometimes': 1, 'Frequently': 2, 'Always': 3, 'Male': 1, 'Female': 0}
+data = data.applymap(lambda x: categoryMap.get(x, x))
+
+get_unique_col_values(data)
+
+#mapping is for the vegetable consumption column
+vegReplace = {3:2, 2:1, 1:0}
+data['vegetable_cons'] = data['vegetable_cons'].replace(vegReplace)
+
+#mapping is for the meal number column. There should only be 3 options not 4
+#it appears that some people were responding with integer values not ordinal
+#this accounts for that
+mealReplace = {4:2, 3:1, 2:0, 1:0}
+data['meal_num'] = data['meal_num'].replace(mealReplace)
+
+#mapping is for the water consumption column
+waterReplace = vegReplace
+data['water_cons'] = data['water_cons'].replace(waterReplace)
+
+get_unique_col_values(data)
+
+#one hot encodes the transport type column. This turns the column into 5 new ones
+#within a new dataframe
+encoder = OneHotEncoder()
+encodedTransport = encoder.fit_transform(data[['transport_type']])
+
+encodedTransport_df = pd.DataFrame(encodedTransport.toarray(), columns = encoder.get_feature_names_out(['transport_type']))
+
+encodedTransport_df.head()
+
+#renames the encoded data frame columns
+renameTransport = ['automobile', 'bike', 'motorbike', 'public_transport', 'walking']
+
+encodedTransport_df.columns = renameTransport
+
+encodedTransport_df.head()
+
+#combines the cleaned data with the encoded dataframe
+dataConcat = pd.concat([data, encodedTransport_df], axis = 1)
+dataConcat.head()
+
+#rearranges the columns
+colRearrange = [c for c in dataConcat.columns if c not in ['bmi', 'obesity_class']] + ['bmi', 'obesity_class']
+dataFinal = dataConcat[colRearrange]
+dataFinal.head()
+
+dataFinal.info()
+
+#drops the column for transport type (this was encoded to 5 new columns)
+dataFinal = dataFinal.drop(columns=['transport_type'])
+ignore = [ 'age', 'bmi', 'obesity_class']
+
+colsConvert = []
+
+#changes the data type of most columns to integer
+for c in dataFinal.columns:
+  if c not in ignore:
+    colsConvert.append(c)
+
+dataFinal[colsConvert] = dataFinal[colsConvert].astype('int')
+
+dataFinal.info()
+
+dataFinal.describe()
+
+dataFinal.head()
+
+#creates dataframe of just features
+features_df = dataFinal.drop(columns=['bmi', 'obesity_class'])
+features_df.info()
+
+#creates and plots a correlation matrix
+corrMatrix = features_df.corr()
+
+plt.figure(figsize = (15,10))
+sns.heatmap(corrMatrix, annot=True, cmap='coolwarm', fmt=".2f")
+plt.title('Correlation Matrix')
+plt.show()
+
+#creates and plots a pair plot
+plt.figure(figsize=(15, 10))
+plt.scatter(features_df['age'], dataFinal['bmi'], s = 50, alpha = .5, color = 'green')
+plt.ylabel('BMI', fontsize = 14)
+plt.xlabel('Age', fontsize = 14)
+plt.title('BMI vs. Age', fontsize = 18)
+
+#creates matrix X and vector y
+X = features_df
+y = dataFinal['bmi']
+
+#function to calculate vif of features
+def calculate_vif(df):
+    vifData = pd.DataFrame()
+    vifData['feature'] = df.columns
+    vifData['vif'] = [variance_inflation_factor(df.values, i) for i in range(X.shape[1])]
+    return vifData
+
+calculate_vif(X)
+
+#drops a column and calls function again
+X = X.drop(columns = 'public_transport')
+
+calculate_vif(X)
+
+#drops a column and calls function again
+X = X.drop(columns = 'age')
+
+calculate_vif(X)
+
+#drops a column and calls function again
+X = X.drop(columns = 'high_cal')
+
+calculate_vif(X)
+
+#drops a column and calls function again
+X = X.drop(columns = 'between_meals')
+calculate_vif(X)
+
+X.head()
+
+#splits X and y into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 1)
+
+# This takes several minutes to run. You can run this if you would like,
+# but I have done this already and have indicated which model is chosen after this has run.
+
+# bestFeatures = None
+# bestModel = None
+# best_mse = float('inf')
+
+# for k in range(1, len(X_train.columns) + 1):
+#   for comb in combinations(X_train.columns, k):
+#     loopModel = LinearRegression()
+#     loopModel.fit(X_train[list(comb)], y_train)
+
+#     y_pred = loopModel.predict(X_test[list(comb)])
+
+#     mse = mean_squared_error(y_test, y_pred)
+
+#     if mse < best_mse:
+#       bestFeatures = list(comb)
+#       bestModel = loopModel
+#       best_mse = mse
+
+# print(bestFeatures)
+# print(best_mse)
+
+#these were obtained after running the previous cell
+#they are saved for convenience
+savedbestFeatures = ['gender', 'family_hist', 'vegetable_cons', 'monitor_cal', 'physical_act', 'tech_time', 'alcohol_cons']
+savedbest_mse = 37.04187081864214
+
+#converts previous cells info into a useable format for statmodels
+sklearnPred_string = ' + '.join(savedbestFeatures)
+sklearnFormula = f'bmi ~ {sklearnPred_string}'
+
+trainData = pd.concat([X_train, y_train], axis=1)
+
+#recreates model and prints summary
+sklearnModel = smf.ols(formula=sklearnFormula, data=trainData).fit()
+
+print(sklearnModel.summary())
+
+#drops gender and puts variables into format for statmodels
+backelimFeatures = ['family_hist', 'vegetable_cons', 'monitor_cal', 'physical_act', 'tech_time', 'alcohol_cons']
+sklearnPred_string2 = ' + '.join(backelimFeatures)
+sklearnFormula2 = f'bmi ~ {sklearnPred_string2}'
+
+#creates new model and prints summary
+sklearnModel2 = smf.ols(formula=sklearnFormula2, data=trainData).fit()
+
+print(sklearnModel2.summary())
+
+#calculates mse of new model
+y_pred = sklearnModel2.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+
+print(f'MSE of the model is {mse}')
+
+#calculates mse of new model
+y_pred = sklearnModel2.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+
+print(f'MSE of the model is {mse}')
+
+#reformats the previous cell's result to statmodels format
+finalFormula = f'bmi ~ {" + ".join(selectedPredictors)}'
+
+#recreates model and prints summary
+finalModel = smf.ols(formula=finalFormula, data=trainData).fit()
+
+print(finalModel.summary())
+
+#calculates mse of latest model
+y_pred = finalModel.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+
+print(f'MSE of the model is {mse}')
+
+#creates 4 diagnostic plots similar to ones found in R
+fittedVals = sklearnModel2.fittedvalues
+residuals = sklearnModel2.resid
+
+fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+
+#residual vs fitted
+sns.residplot(x = fittedVals, y = residuals, lowess = True, line_kws = {'color': 'red', 'lw': 1}, ax = axs[0, 0])
+axs[0, 0].set_xlabel('Fitted Values', fontsize=14)
+axs[0, 0].set_ylabel('Residuals', fontsize=14)
+axs[0, 0].set_title('Residuals vs. Fitted', fontsize=16)
+axs[0, 0].set_xlim(10, 40)
+
+#normal q-q plot
+qqplot(residuals, line = '45', ax = axs[0, 1])
+axs[0, 1].set_title('Normal Q-Q', fontsize=16)
+
+#scale location plot
+standardized_residuals = residuals / np.std(residuals)
+sqrt_standardized_residuals = np.sqrt(np.abs(standardized_residuals))
+axs[1, 0].scatter(fittedVals, sqrt_standardized_residuals)
+sns.regplot(x = fittedVals, y = sqrt_standardized_residuals, scatter = False, lowess = True, line_kws = {'color': 'red', 'lw': 1}, ax = axs[1, 0])
+axs[1, 0].set_xlabel('Fitted Values', fontsize=14)
+axs[1, 0].set_ylabel('Sqrt(Standardized Residuals)', fontsize=14)
+axs[1, 0].set_title('Scale-Location', fontsize=16)
+
+#information and plot for residual vs leverage
+influence = sklearnModel2.get_influence()
+leverage = influence.hat_matrix_diag
+cooks = influence.cooks_distance[0]
+axs[1, 1].scatter(leverage, residuals, alpha=0.5)
+sns.regplot(x = leverage, y = residuals, scatter = False, lowess = True, line_kws = {'color': 'red', 'lw': 1}, ax = axs[1, 1])
+axs[1, 1].set_xlabel('Leverage', fontsize=14)
+axs[1, 1].set_ylabel('Residuals', fontsize=14)
+axs[1, 1].set_title('Residuals vs Leverage', fontsize=16)
+p = len(sklearnModel2.params)
+x = np.linspace(0, max(leverage), 100)
+for i in [0.5, 1]:
+    axs[1, 1].plot(x, np.sqrt(i * (p * (1 - x) / x)), linestyle = '--', color = 'red')
+    axs[1, 1].plot(x, -np.sqrt(i * (p * (1 - x) / x)), linestyle = '--', color = 'red')
+
+#shows all plots
+plt.tight_layout()
+plt.show()
+
+dataFinal.info()
+
+#removes bmi since we are using obesity class for classification
+rf_df = dataFinal.drop(columns=['bmi'])
+rf_df.info()
+
+#creates new X and y then splits into training and test sets
+X = rf_df.drop(columns = ['obesity_class'])
+y = rf_df['obesity_class']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 1)
+
+#creates loop for random forest models with different estimator amounts
+n_estimatorsList = [1, 10, 50, 100, 200, 300, 500, 750, 1000]
+
+accuracyValues = []
+
+for n in n_estimatorsList:
+    rfClassifier = RandomForestClassifier(n_estimators = n, random_state = 1, max_features = 'sqrt')
+    rfClassifier.fit(X_train, y_train)
+
+    y_pred = rfClassifier.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    accuracyValues.append(accuracy)
+
+    print(f'Accuracy with {n} estimators: {accuracy}')
+
+#plots accuracy vs number of estimators using previous cell's info
+plt.figure(figsize = (10,10))
+plt.plot(n_estimatorsList, accuracyValues, marker = '.', linewidth = 2, markersize = 10, label = 'Random Forest')
+plt.xlabel('Number of Estimators')
+plt.ylabel('Accuracy')
+plt.title('Accuracy vs. Number of Estimators')
+plt.ylim(0.55, 0.85)
+plt.legend()
+plt.show()
+
+rfClassifier = RandomForestClassifier(n_estimators = 50, random_state = 1, max_features = 'sqrt')
+rfClassifier.fit(X_train, y_train)
+
+y_pred = rfClassifier.predict(X_test)
+
+#plots confusion matrix
+labeling = ['Underweight', 'Normal', 'Overweight', 'Obesity_I', 'Obesity_II', 'Obesity_III']
+rf_cm = confusion_matrix(y_test, y_pred, labels = labeling)
+sns.heatmap(rf_cm, annot = True, cmap = 'Blues')
+plt.xlabel('Predicted', fontsize = 14)
+plt.ylabel('True', fontsize = 14)
+plt.title('Confusion Matrix for Random Forest Model with 50 Estimators', fontsize = 16)
+plt.show()
+
+#prints report
+rf_report = classification_report(y_test, y_pred, labels = labeling)
+print(rf_report)
+
+#remaps the target variable column to align with xgboost format
+targetMap = {'Underweight': 0, 'Normal': 1, 'Overweight': 2, 'Obesity_I': 3, 'Obesity_II': 4, 'Obesity_III': 5}
+data_xgb = dataFinal.applymap(lambda x: targetMap.get(x, x))
+
+#creates new y the splits data for training and testing sets
+y = data_xgb['obesity_class']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 1)
+
+#creates loop for xgboost models with different estimator amounts
+accuracyValuesXGB = []
+
+for n in n_estimatorsList:
+    xgbClassifier = xgb.XGBClassifier(n_estimators = n, random_state = 1, subsample = 0.5, colsample_bytree = 0.8)
+    xgbClassifier.fit(X_train, y_train)
+
+    y_pred = xgbClassifier.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    accuracyValuesXGB.append(accuracy)
+
+    print(f'Accuracy with {n} estimators: {accuracy}')
+
+#plots accuracy vs number of estimators using previous cell's info
+plt.figure(figsize = (10,10))
+plt.plot(n_estimatorsList, accuracyValuesXGB, marker = '.', linewidth = 2, markersize = 10, color = 'red', label = 'XGBoost')
+plt.xlabel('Number of Estimators')
+plt.ylabel('Accuracy')
+plt.title('Accuracy vs. Number of Estimators')
+plt.ylim(0.55, 0.85)
+plt.legend()
+plt.show()
+
+xgbClassifier = xgb.XGBClassifier(n_estimators = 50, random_state = 1, subsample = 0.5, colsample_bytree = 0.8)
+xgbClassifier.fit(X_train, y_train)
+
+y_pred = xgbClassifier.predict(X_test)
+
+#plots confusion matrix
+xgb_cm = confusion_matrix(y_test, y_pred)
+sns.heatmap(xgb_cm, annot = True, cmap = 'Reds')
+plt.xlabel('Predicted', fontsize= 14)
+plt.ylabel('True', fontsize= 14)
+plt.title('Confusion Matrix for XGBoost Model with 50 Estimators', fontsize= 16)
+plt.show()
+
+#prints report
+xgb_report = classification_report(y_test, y_pred)
+print(xgb_report)
+
+#plots accuracy vs number of estimators
+#compares random forest models to xgboost models
+plt.figure(figsize = (10,10))
+plt.plot(n_estimatorsList, accuracyValues, marker = '.', linewidth = 2, markersize = 10, label = 'Random Forest')
+plt.plot(n_estimatorsList, accuracyValuesXGB, marker = '.', linewidth = 2, markersize = 10, color = 'red', label = 'XGBoost')
+plt.xlabel('Number of Estimators')
+plt.ylabel('Accuracy')
+plt.title('Accuracy vs. Number of Estimators')
+plt.ylim(0.55, 0.85)
+plt.legend()
+plt.show()
+
+#prints reports to compare
+print('Random Forest Report', rf_report, sep = '\n \n')
+print('--------------------','XGBoost Report',xgb_report, sep = '\n \n')
